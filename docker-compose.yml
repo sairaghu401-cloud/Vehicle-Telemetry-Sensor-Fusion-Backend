@@ -1,0 +1,59 @@
+services:
+  api:
+    build: .
+    container_name: telemetry_api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # These override .env so the API always reaches Postgres/Redis by their
+      # service names (Docker's internal DNS), not localhost — inside the
+      # Docker network, "db" and "redis" resolve to the other containers.
+      POSTGRES_HOST: db
+      REDIS_HOST: redis
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  db:
+    image: postgres:16-alpine
+    container_name: telemetry_db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-telemetry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-telemetry_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-telemetry}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telemetry}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: telemetry_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,23 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+sqlalchemy==2.0.35
+alembic==1.13.3
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+redis==5.1.1
+pydantic==2.9.2
+pydantic-settings==2.5.2
+email-validator==2.2.0
+
+python-jose[cryptography]==3.3.0
+passlib==1.7.4
+# Pinned explicitly, NOT left to passlib[bcrypt]'s unpinned transitive dep:
+# passlib 1.7.4 (last released 2020, effectively unmaintained) does a
+# self-test on import that breaks against bcrypt's newer major versions
+# (confirmed broken against bcrypt 5.0.0 with "password cannot be longer
+# than 72 bytes" — a red herring; the real cause is an internal passlib/
+# bcrypt API mismatch, not an actual oversized password). 4.0.1 is the
+# last bcrypt release confirmed compatible with passlib 1.7.4.
+bcrypt==4.0.1
+python-multipart==0.0.12
+websockets==13.1
