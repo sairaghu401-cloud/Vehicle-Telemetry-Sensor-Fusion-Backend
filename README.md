@@ -4,10 +4,11 @@ A backend that ingests live multi-sensor data (radar, ToF, GPS) from embedded de
 fuses and validates it server-side, stores it for historical analysis, and exposes it
 through a documented, secure API.
 
-**Status:** Step 6 complete — project scaffold, Docker Compose stack, health check,
+**Status:** Step 7 complete — project scaffold, Docker Compose stack, health check,
 database schema with Alembic migrations, REST API, WebSocket live ingestion with
-Redis current-state, radar/ToF sensor fusion with anomaly detection, and auth
-(per-device API keys for ingestion + JWT for the dashboard/REST API).
+Redis current-state, radar/ToF sensor fusion with anomaly detection, auth
+(per-device API keys for ingestion + JWT for the dashboard/REST API), and a
+pytest integration suite covering fusion, auth, devices, and WebSocket ingestion.
 
 ## Stack
 
@@ -160,6 +161,60 @@ blind spots:
   `alembic/versions/..._create_devices_sensor_readings_fused_.py`).
 - It has no idea about data migrations (e.g. backfilling a new required
   column) — those are always written by hand.
+
+## Running the tests
+
+```bash
+# Postgres and Redis need to be reachable on localhost (the test suite
+# talks to them directly, not through the api container) — the full stack
+# or just the two dependencies both work:
+docker compose up -d db redis
+
+# From your local venv (see "Local development without Docker" above —
+# pytest isn't installed in the Docker image itself, only requirements.txt
+# is, not requirements-dev.txt, which is deliberate: a production image
+# shouldn't ship test tooling):
+pip install -r requirements-dev.txt
+pytest
+# or, to see each test name and its result:
+pytest -v
+```
+
+**The tests use their own database (`telemetry_test`) and their own Redis
+index, never your dev data.** `tests/conftest.py` points the app at
+`POSTGRES_DB=telemetry_test` and `REDIS_DB=15` *before* any app module is
+imported — see the big comment at the top of that file for exactly why the
+ordering matters. Every test run drops and recreates `telemetry_test` from
+scratch (via `Base.metadata.create_all`, not Alembic — these tests check
+the schema matches the models, not that the migration scripts work), and
+every individual test gets a clean slate (`TRUNCATE` + `FLUSHDB` after each
+one). You can run `pytest` as many times as you want without ever touching
+the devices/readings you've created manually while poking at the API by
+hand.
+
+What's covered:
+- `tests/test_fusion.py` — pure unit tests of the fusion decision logic
+  (no DB, no network — these run in milliseconds; see step 5).
+- `tests/test_auth.py` — registration validation, login success/failure
+  (including the anti-enumeration same-error-message behavior), and the
+  `get_current_user` dependency protecting `/devices/*` (no token, a
+  malformed token, a token for a since-deleted user).
+- `tests/test_devices.py` — device registration/duplicates, 404 handling,
+  and the paginated `/history` and `/fused-events` endpoints (pagination
+  actually not overlapping across pages, filters actually filtering).
+- `tests/test_ws_ingestion.py` — a real WebSocket handshake against the
+  real app: a valid API key gets acked and durably stored, an invalid key
+  is rejected at the handshake (before `accept()`), a malformed message
+  gets an error ack without killing the connection, and ingesting a
+  matching radar+ToF pair actually produces a fused event end-to-end.
+
+These are genuine integration tests — real Postgres, real Redis, the real
+FastAPI app wired together exactly as it runs in Docker — not mocks. That's
+a deliberate tradeoff: slower than pure unit tests (seconds, not
+milliseconds), but they catch the bugs that actually show up at the
+boundaries between layers, which is where most of the real bugs caught
+while building this project (see the design-decision call-outs throughout
+this README) actually lived.
 
 ## Design decisions worth knowing about
 
@@ -493,6 +548,55 @@ docker compose exec api pytest tests/test_fusion.py -v
   development; a real frontend would just POST that same form data from an
   HTML `<form>`.
 
+## Design decisions worth knowing about — testing
+
+- **A dedicated `telemetry_test` database, created and torn down by the
+  test suite itself, not your dev database.** The alternative — reusing
+  the dev database and wrapping each test in a transaction that gets
+  rolled back — is a legitimate pattern too, but it breaks down here
+  because several endpoints call `db.commit()` explicitly mid-request (see
+  `app/api/devices.py`, `app/ws/ingest.py`), and a commit inside a test's
+  "outer" transaction can't be cleanly undone by rolling that transaction
+  back afterward. A separate database sidesteps the problem entirely at
+  the cost of a slightly slower setup step (session-scoped, so it's paid
+  once per test run, not once per test).
+- **`Base.metadata.create_all`, not Alembic, builds the test schema.**
+  These integration tests exist to catch bugs in the application code —
+  auth, pagination, fusion-on-ingest — against a schema that matches the
+  current models. Whether `alembic upgrade head` from an empty database
+  correctly reaches that same schema is a different, narrower question,
+  worth its own (currently not written) migration test if this project's
+  migration history ever gets complicated enough to need one.
+- **Env vars are overridden at the very top of `conftest.py`, before any
+  `app.*` import.** `app/db/session.py` and `app/db/redis.py` build their
+  engine/client as module-level singletons the moment they're first
+  imported — exactly once, like in production. Setting
+  `POSTGRES_DB`/`REDIS_DB` even one import too late means those singletons
+  already locked in the wrong (dev) target. This is also why the tests
+  don't need to override FastAPI's `get_db` dependency: the engine itself
+  points at the test database, so REST endpoints (`Depends(get_db)`) and
+  the WebSocket endpoint (which imports `AsyncSessionLocal` directly) both
+  transparently use it.
+- **A manually-overridden, session-scoped `event_loop` fixture, instead of
+  pytest-asyncio's per-test default.** The DB engine and Redis client are
+  singletons with one connection pool each, for the whole process — just
+  like in production. pytest-asyncio's default behavior hands every test
+  function a *brand-new* event loop, but an asyncpg/redis connection is
+  permanently bound to whatever loop created it; reusing a pooled
+  connection under a different loop fails with "attached to a different
+  loop" or "Event loop is closed." One shared loop for the whole session
+  matches the "created once, reused everywhere" lifetime the engine
+  already assumes.
+- **WebSocket tests open their own `ws_capable_client()` per test, instead
+  of sharing a fixture.** httpx-ws's `ASGIWebSocketTransport` opens an
+  `anyio` task group that must be entered and exited by the *same* asyncio
+  Task — but pytest-asyncio always runs a fixture's setup and its teardown
+  as two separate Tasks, even at session scope. Opening and closing the
+  transport entirely within one test function's `async with` block (one
+  Task, start to finish) is what actually satisfies that constraint; see
+  the comment above `ws_capable_client` in `tests/conftest.py` for the
+  full trace of the error this avoids.
+
 ## Roadmap
 
 1. ~~Project scaffold, docker-compose~~ ✅
@@ -501,6 +605,6 @@ docker compose exec api pytest tests/test_fusion.py -v
 4. ~~WebSocket ingestion endpoint~~ ✅
 5. ~~Sensor fusion logic (radar vs. ToF cross-validation)~~ ✅
 6. ~~Auth — per-device API keys (ingestion) + JWT (dashboard/REST)~~ ✅
-7. Testing (pytest)
+7. ~~Testing (pytest) — fusion, auth, devices, WebSocket ingestion~~ ✅
 8. CI/CD (GitHub Actions)
 9. Full documentation + architecture diagram

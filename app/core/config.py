@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     # Redis
     redis_host: str = "redis"
     redis_port: int = 6379
+    redis_db: int = 0
 
     # Auth
     jwt_secret_key: str = "change_me_dev_secret_do_not_use_in_prod"
@@ -54,7 +55,12 @@ class Settings(BaseSettings):
 
     @property
     def redis_url(self) -> str:
-        return f"redis://{self.redis_host}:{self.redis_port}/0"
+        # The trailing /N is Redis's "logical database" index — not a
+        # separate server, just a numbered namespace within the same Redis
+        # instance. Tests use a different index (see tests/conftest.py) so
+        # they can freely FLUSHDB without touching whatever live-state keys
+        # your dev server has written while you were testing manually.
+        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
 
 @lru_cache

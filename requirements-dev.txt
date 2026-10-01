@@ -2,3 +2,10 @@
 pytest==8.3.3
 pytest-asyncio==0.24.0
 httpx==0.27.2
+# Lets tests open a real WebSocket connection to the ASGI app in-process,
+# on the SAME event loop as everything else in the test (see
+# tests/conftest.py's `client` fixture docstring for why that matters —
+# Starlette's own TestClient.websocket_connect runs the app in a separate
+# thread/event loop, which breaks this app's module-level async DB engine).
+httpx-ws==0.9.0
+wsproto==1.3.2
