@@ -347,6 +347,7 @@ hand.
 What's covered:
 - `tests/test_fusion.py` — pure unit tests of the fusion decision logic
   (no DB, no network — these run in milliseconds; see step 5).
+- `tests/test_config.py` — the production JWT-secret startup check (default rejected, short rejected, strong accepted, development unaffected).
 - `tests/test_auth.py` — registration validation, login success/failure
   (including the anti-enumeration same-error-message behavior), and the
   `get_current_user` dependency protecting `/devices/*` (no token, a
@@ -672,6 +673,14 @@ docker compose exec api pytest tests/test_fusion.py -v
   (`authenticate_device_by_api_key`, already in place since step 4, and
   the new `get_current_user`) instead of one — and why `/ws/ingest` needed
   zero changes in this step.
+- **The app refuses to start in production with a weak JWT secret.**
+  `JWT_SECRET_KEY` signs every login token, and the placeholder in
+  `.env.example` is public. `Settings` (`app/core/config.py`) raises at
+  startup if `APP_ENV=production` and the secret is that placeholder or
+  shorter than 32 characters, so a forgotten env var fails loudly on deploy
+  instead of silently leaving the API open to forged tokens. Development and
+  tests keep the default. Generate a real one with
+  `python -c "import secrets; print(secrets.token_hex(32))"`.
 - **Passwords are hashed with the same `passlib`/bcrypt setup as API
   keys** (`app/core/security.py`) — one hashing primitive reused for both,
   rather than a second hashing library. Same pin, same tradeoffs already

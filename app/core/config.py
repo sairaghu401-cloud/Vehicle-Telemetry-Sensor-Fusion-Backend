@@ -11,7 +11,13 @@ typed object to import. This means:
   - Autocomplete works: settings.postgres_host instead of guessing string keys.
 """
 from functools import lru_cache
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The placeholder shipped in .env.example and used as the fallback below.
+# Anyone who has read this repo knows it, so it must never sign real tokens.
+DEFAULT_JWT_SECRET = "change_me_dev_secret_do_not_use_in_prod"
+MIN_PRODUCTION_JWT_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -30,12 +36,36 @@ class Settings(BaseSettings):
     redis_db: int = 0
 
     # Auth
-    jwt_secret_key: str = "change_me_dev_secret_do_not_use_in_prod"
+    jwt_secret_key: str = DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60
 
     # App
     app_env: str = "development"
+
+    @model_validator(mode="after")
+    def _refuse_weak_jwt_secret_in_production(self) -> "Settings":
+        """
+        Fail at startup, not at the first forged token.
+
+        JWTs are signed with this secret. If it is the well-known
+        placeholder from this public repo (or just short), anyone can mint a
+        valid token for any user and the whole REST API is open. Development
+        and test runs keep the convenient default; APP_ENV=production does
+        not get to.
+        """
+        if self.app_env.lower() == "production":
+            if (
+                self.jwt_secret_key == DEFAULT_JWT_SECRET
+                or len(self.jwt_secret_key) < MIN_PRODUCTION_JWT_SECRET_LENGTH
+            ):
+                raise ValueError(
+                    "Refusing to start with APP_ENV=production and a weak JWT_SECRET_KEY "
+                    f"(must not be the default and must be at least {MIN_PRODUCTION_JWT_SECRET_LENGTH} "
+                    "characters). Generate one with: "
+                    'python -c "import secrets; print(secrets.token_hex(32))"'
+                )
+        return self
 
     @property
     def database_url(self) -> str:
