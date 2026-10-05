@@ -87,6 +87,37 @@ async def register_device(
     )
 
 
+@router.post("/{device_id}/rotate-key", response_model=DeviceCreateResponse)
+async def rotate_device_key(
+    device_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    """
+    Issue a new API key for a device and invalidate the old one.
+
+    This is the recovery path for a lost or leaked key (the raw key is only
+    ever shown once, at registration). The new raw key is returned ONCE here;
+    only its hash is stored. The old key stops working for new connections
+    immediately, because ingestion checks keys against the stored hash at
+    connect time. A WebSocket that is ALREADY open with the old key stays
+    open until it disconnects, since authentication happens once at the
+    handshake; reconnecting with the old key is rejected.
+    """
+    device = await _get_device_or_404(device_id, db)
+
+    raw_key = generate_api_key()
+    device.api_key_hash = hash_api_key(raw_key)
+    await db.commit()
+    await db.refresh(device)
+
+    return DeviceCreateResponse(
+        id=device.id,
+        name=device.name,
+        device_code=device.device_code,
+        api_key=raw_key,
+        created_at=device.created_at,
+    )
+
+
 @router.get("", response_model=list[DeviceOut])
 async def list_devices(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     result = await db.execute(select(Device).order_by(Device.created_at.desc()))

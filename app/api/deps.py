@@ -7,15 +7,18 @@ that needs "which device is this?" or "which user is this?" reimplementing
 lookup/verification logic, we define it once here and endpoints just
 declare they need it — FastAPI handles calling it and wiring the result in.
 """
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.security import decode_access_token, verify_api_key
+from app.db.redis import redis_client
 from app.db.session import get_db
 from app.models.device import Device
 from app.models.user import User
+from app.services.rate_limit import check_rate_limit
 
 # tokenUrl points Swagger's "Authorize" button at our login endpoint so it
 # knows where to POST credentials and how to fetch a token — it doesn't
@@ -78,3 +81,33 @@ async def get_current_user(
         raise credentials_error
 
     return user
+
+
+def rate_limit(scope: str, attempts_setting: str):
+    """
+    Builds a dependency that rejects a client with 429 once it exceeds the
+    configured number of requests to this scope within the window.
+
+    Used as `dependencies=[Depends(rate_limit("login", "login_rate_limit_attempts"))]`
+    so the limit is checked BEFORE the endpoint does any real work (for
+    login: before a bcrypt check is spent on a guess). `attempts_setting`
+    names a field on Settings, read at request time so tests/ops can tune it.
+    """
+
+    async def dependency(request: Request) -> None:
+        settings = get_settings()
+        client_ip = request.client.host if request.client else "unknown"
+        result = await check_rate_limit(
+            redis_client,
+            key=f"ratelimit:{scope}:{client_ip}",
+            limit=getattr(settings, attempts_setting),
+            window_seconds=settings.rate_limit_window_seconds,
+        )
+        if not result.allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Too many requests. Try again in {result.retry_after_seconds} seconds.",
+                headers={"Retry-After": str(result.retry_after_seconds)},
+            )
+
+    return dependency

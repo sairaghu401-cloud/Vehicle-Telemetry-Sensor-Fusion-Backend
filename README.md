@@ -347,6 +347,8 @@ hand.
 What's covered:
 - `tests/test_fusion.py` — pure unit tests of the fusion decision logic
   (no DB, no network — these run in milliseconds; see step 5).
+- `tests/test_rate_limit.py` — the limiter itself (limit, per-key counting, always-expiring counters, fail-open) and its wiring onto login/register, including that a blocked client is refused even with the correct password.
+- `tests/test_key_rotation.py` — rotation returns a new key, requires auth, 404s on unknown devices, and the old key is rejected at the WebSocket handshake while the new one works.
 - `tests/test_config.py` — the production JWT-secret startup check (default rejected, short rejected, strong accepted, development unaffected).
 - `tests/test_auth.py` — registration validation, login success/failure
   (including the anti-enumeration same-error-message behavior), and the
@@ -446,6 +448,9 @@ curl -X POST http://localhost:8000/devices \
   -H "Content-Type: application/json" \
   -d '{"name": "Front bumper radar", "device_code": "ESP32-A1"}'
 # -> {"id": "...", "name": "...", "device_code": "ESP32-A1", "api_key": "sk_live_...", "created_at": "..."}
+
+# Lost or leaked a device key? Rotate it: returns a new key once, old key stops working
+curl -X POST http://localhost:8000/devices/{device_id}/rotate-key -H "Authorization: Bearer $TOKEN"
 
 # List all devices (api_key_hash is never included in any response)
 curl http://localhost:8000/devices -H "Authorization: Bearer $TOKEN"
@@ -673,6 +678,23 @@ docker compose exec api pytest tests/test_fusion.py -v
   (`authenticate_device_by_api_key`, already in place since step 4, and
   the new `get_current_user`) instead of one — and why `/ws/ingest` needed
   zero changes in this step.
+- **Rate limiting on `/auth/login` and `/auth/register`** (Redis, per client
+  IP; defaults 10 logins and 5 registrations per 60 s, tunable via
+  `LOGIN_RATE_LIMIT_ATTEMPTS`, `REGISTER_RATE_LIMIT_ATTEMPTS`,
+  `RATE_LIMIT_WINDOW_SECONDS`). The limit is a dependency that runs *before*
+  the endpoint, so a blocked client does not even get a bcrypt check spent
+  on its guess, and gets `429` with a `Retry-After` header. Tradeoffs, also
+  documented in `app/services/rate_limit.py`: it is a fixed window (a caller
+  can burst ~2x the limit across a window boundary); it keys on IP rather than
+  account on purpose, since locking an *account* after N bad attempts lets
+  anyone lock out a victim; behind a reverse proxy you need uvicorn's
+  `--proxy-headers` or every client looks like the proxy; and it fails
+  *open* if Redis is down, so an outage does not take login down with it.
+- **Device keys can be rotated** with `POST /devices/{id}/rotate-key`
+  (dashboard-authenticated). Only a hash is stored, so a lost key cannot be
+  recovered, only replaced. The old key is rejected on the next connection;
+  a WebSocket already open with it stays open until it disconnects, because
+  keys are checked once at the handshake.
 - **The app refuses to start in production with a weak JWT secret.**
   `JWT_SECRET_KEY` signs every login token, and the placeholder in
   `.env.example` is public. `Settings` (`app/core/config.py`) raises at

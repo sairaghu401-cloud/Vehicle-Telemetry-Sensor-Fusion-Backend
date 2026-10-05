@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60
 
+    # Rate limiting (per client IP, per window)
+    rate_limit_window_seconds: int = 60
+    login_rate_limit_attempts: int = 10
+    register_rate_limit_attempts: int = 5
+
     # App
     app_env: str = "development"
 
