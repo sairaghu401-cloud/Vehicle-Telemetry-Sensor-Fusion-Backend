@@ -6,12 +6,13 @@ A backend that ingests live multi-sensor data (radar, ToF, GPS) from embedded de
 fuses and validates it server-side, stores it for historical analysis, and exposes it
 through a documented, secure API.
 
-**Status:** Step 8 complete — project scaffold, Docker Compose stack, health check,
+**Status:** All nine build steps complete — project scaffold, Docker Compose stack, health check,
 database schema with Alembic migrations, REST API, WebSocket live ingestion with
 Redis current-state, radar/ToF sensor fusion with anomaly detection, auth
 (per-device API keys for ingestion + JWT for the dashboard/REST API), and a
 pytest integration suite covering fusion, auth, devices, and WebSocket ingestion,
 and a GitHub Actions pipeline that tests, checks migrations, and builds the Docker image on every push.
+See [Architecture](#architecture) for how the pieces fit together.
 
 ## Stack
 
@@ -22,6 +23,153 @@ and a GitHub Actions pipeline that tests, checks migrations, and builds the Dock
 - **Auth:** API keys per device (ingestion) + JWT (dashboard/user access)
 - **Containerization:** Docker + docker-compose
 - **CI/CD:** GitHub Actions
+
+## Quick start
+
+```bash
+git clone https://github.com/sairaghu401-cloud/Vehicle-Telemetry-Sensor-Fusion-Backend.git
+cd Vehicle-Telemetry-Sensor-Fusion-Backend
+cp .env.example .env
+docker compose up -d --build
+docker compose exec api alembic upgrade head
+```
+
+Then, end to end (the API is at `http://localhost:8000`, interactive docs at `/docs`):
+
+```bash
+# 1. Create a dashboard user and log in (login is form-encoded, not JSON)
+curl -X POST localhost:8000/auth/register -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "password": "a-strong-password"}'
+TOKEN=$(curl -s -X POST localhost:8000/auth/login \
+  -d "username=you@example.com&password=a-strong-password" | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# 2. Register a device. Save the api_key from the response, it is shown once.
+curl -X POST localhost:8000/devices -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name": "Front radar", "device_code": "ESP32-A1"}'
+
+# 3. Stream readings as that device (sends one radar, one ToF, one GPS reading)
+python scripts/test_ingest_client.py sk_live_your_key_here
+
+# 4. Read it back
+curl localhost:8000/devices/{device_id}/live          -H "Authorization: Bearer $TOKEN"
+curl localhost:8000/devices/{device_id}/history       -H "Authorization: Bearer $TOKEN"
+curl localhost:8000/devices/{device_id}/fused-events -H "Authorization: Bearer $TOKEN"   # add ?status=anomaly to filter
+```
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Edge["Embedded devices"]
+        D1["ESP32 / Raspberry Pi<br/>radar + ToF + GPS"]
+    end
+    subgraph Users["Dashboard users"]
+        U1["Browser / curl / Swagger UI"]
+    end
+    subgraph API["FastAPI app (Docker container)"]
+        WS["/ws/ingest<br/>WebSocket"]
+        AUTHR["/auth/register, /auth/login"]
+        REST["/devices/*<br/>REST, JWT-protected"]
+        FUS["Fusion service<br/>radar vs ToF"]
+    end
+    PG[("PostgreSQL<br/>source of truth")]
+    RD[("Redis<br/>current state, 5 min TTL")]
+
+    D1 -- "API key in query string" --> WS
+    U1 -- "JWT bearer token" --> REST
+    U1 --> AUTHR
+    WS -- "1. store reading" --> PG
+    WS -- "2. update latest" --> RD
+    WS -- "3. try to fuse" --> FUS
+    FUS -- "write fused event" --> PG
+    REST -- "history, fused events" --> PG
+    REST -- "live state" --> RD
+    AUTHR --> PG
+```
+
+Postgres is the source of truth: every reading is committed there first.
+Redis only holds each device's latest reading (so a dashboard can poll it
+cheaply) and expires it after 5 minutes of silence. Devices and people
+authenticate differently on purpose: devices with a long-lived API key on
+the WebSocket, people with a short-lived JWT on the REST API.
+
+**What happens to one reading** (`/ws/ingest`):
+
+```mermaid
+sequenceDiagram
+    participant Dev as Device
+    participant WS as /ws/ingest
+    participant PG as PostgreSQL
+    participant RD as Redis
+    participant F as Fusion service
+
+    Dev->>WS: connect ?api_key=sk_live_...
+    WS->>PG: verify key against stored bcrypt hashes
+    alt key invalid
+        WS-->>Dev: close 1008 (before accept)
+    else key valid
+        WS-->>Dev: accept
+    end
+    loop one message per reading
+        Dev->>WS: {sensor_type, recorded_at, ...}
+        alt malformed
+            WS-->>Dev: {status: error}, connection stays open
+        else valid
+            WS->>PG: INSERT sensor_reading, COMMIT
+            WS->>RD: SET device:id:latest (TTL 300s)
+            WS-->>Dev: {status: ok, reading_id}
+            WS->>F: try_fuse_reading
+            F->>PG: find unused reading from other sensor within 2 s
+            opt partner found
+                F->>PG: INSERT fused_event (ok / anomaly)
+            end
+        end
+    end
+```
+
+**Database schema** (migrations in `alembic/versions/`):
+
+```mermaid
+erDiagram
+    devices ||--o{ sensor_readings : "produces"
+    devices ||--o{ fused_events : "has"
+    devices {
+        uuid id PK
+        string device_code UK
+        string name
+        string api_key_hash
+        bool is_active
+        timestamptz created_at
+    }
+    sensor_readings {
+        bigint id PK
+        uuid device_id FK
+        enum sensor_type "radar, tof, gps"
+        timestamptz recorded_at
+        float distance_m
+        float latitude
+        float longitude
+        timestamptz ingested_at
+    }
+    fused_events {
+        uuid id PK
+        uuid device_id FK
+        enum status "ok, anomaly, insufficient_data"
+        float fused_distance_m
+        float discrepancy_m
+        string source_reading_ids
+        timestamptz event_time
+    }
+    users {
+        uuid id PK
+        string email UK
+        string hashed_password
+        timestamptz created_at
+    }
+```
+
+Static copies of these diagrams are in [`docs/`](docs/) for viewers that
+don't render Mermaid.
 
 ## Project layout
 
@@ -42,8 +190,9 @@ vehicle-telemetry-backend/
 ├── alembic/                    # DB migration scripts (env.py wired to our models)
 │   └── versions/                 # one file per migration, in order
 ├── scripts/                      # test_ingest_client.py — manual WebSocket test client
-├── tests/                       # test_fusion.py (unit tests for fusion logic) — full API/WS suite in step 7
-├── .github/workflows/            # CI/CD — step 8
+├── tests/                       # conftest.py + test_fusion/auth/devices/ws_ingestion.py (pytest)
+├── docs/                        # architecture, ingestion-sequence, and schema diagrams (PNG)
+├── .github/workflows/            # ci.yml — tests, migration checks, Docker build + GHCR publish
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt              # Runtime dependencies
@@ -56,7 +205,7 @@ vehicle-telemetry-backend/
 (models, schemas, api routes, services), not by feature. At this project's
 size that keeps related code near its peers — all DB tables in one place,
 all endpoint definitions in one place — so as we add devices, readings, and
-fused events in step 2+, they slot into existing folders rather than each
+fused events, they slot into existing folders rather than each
 feature growing its own parallel mini-app.
 
 ## Prerequisites
@@ -648,4 +797,4 @@ docker build -t telemetry-api:local .
 6. ~~Auth — per-device API keys (ingestion) + JWT (dashboard/REST)~~ ✅
 7. ~~Testing (pytest) — fusion, auth, devices, WebSocket ingestion~~ ✅
 8. ~~CI/CD (GitHub Actions) — tests, migration checks, Docker build + publish~~ ✅
-9. Full documentation + architecture diagram
+9. ~~Full documentation + architecture diagram~~ ✅
