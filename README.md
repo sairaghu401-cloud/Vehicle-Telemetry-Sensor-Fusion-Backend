@@ -1,14 +1,17 @@
 # Vehicle Telemetry & Sensor Fusion Backend
 
+[![CI](https://github.com/sairaghu401-cloud/Vehicle-Telemetry-Sensor-Fusion-Backend/actions/workflows/ci.yml/badge.svg)](https://github.com/sairaghu401-cloud/Vehicle-Telemetry-Sensor-Fusion-Backend/actions/workflows/ci.yml)
+
 A backend that ingests live multi-sensor data (radar, ToF, GPS) from embedded devices,
 fuses and validates it server-side, stores it for historical analysis, and exposes it
 through a documented, secure API.
 
-**Status:** Step 7 complete — project scaffold, Docker Compose stack, health check,
+**Status:** Step 8 complete — project scaffold, Docker Compose stack, health check,
 database schema with Alembic migrations, REST API, WebSocket live ingestion with
 Redis current-state, radar/ToF sensor fusion with anomaly detection, auth
 (per-device API keys for ingestion + JWT for the dashboard/REST API), and a
-pytest integration suite covering fusion, auth, devices, and WebSocket ingestion.
+pytest integration suite covering fusion, auth, devices, and WebSocket ingestion,
+and a GitHub Actions pipeline that tests, checks migrations, and builds the Docker image on every push.
 
 ## Stack
 
@@ -548,6 +551,44 @@ docker compose exec api pytest tests/test_fusion.py -v
   development; a real frontend would just POST that same form data from an
   HTML `<form>`.
 
+## CI/CD (GitHub Actions)
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull
+request targeting `main`, as three jobs:
+
+1. **Tests (pytest)** — starts real Postgres 16 and Redis 7 containers as
+   job services, installs `requirements-dev.txt` on Python 3.11 (same as the
+   Docker image), runs `pytest -v`. No `.env` needed: the service
+   credentials match the defaults in `app/core/config.py`.
+2. **Migrations (Alembic)** — runs `alembic upgrade head` on an empty
+   database, `alembic check` (fails if models and migrations have drifted
+   apart), then `downgrade base` + `upgrade head` again. The tests build
+   their schema with `create_all`, so this is the only place the migration
+   scripts themselves get exercised.
+3. **Docker image** — runs only after 1 and 2 pass. Builds the image,
+   smoke-tests it (`python -c "import app.main"` inside the container),
+   and, on pushes to `main` only (never on pull requests), publishes it to
+   GitHub Container Registry as `ghcr.io/<owner>/<repo>:latest` and
+   `:sha-<commit>`.
+
+Run the same checks locally before pushing:
+
+```bash
+pytest -v
+docker compose exec api alembic check
+docker build -t telemetry-api:local .
+```
+
+**Design notes**
+- `permissions: contents: read` at the top, with `packages: write` granted
+  only to the Docker job: a job gets the least access it needs.
+- `concurrency` cancels an older run when you push again to the same
+  branch, so CI minutes aren't spent on a commit that's already stale.
+- The published image tag comes from `docker/metadata-action` because GHCR
+  requires lowercase image names and this repo's name has capitals.
+- Not included yet: automatic deployment. Publishing the image is the
+  hand-off point; where it runs (a VM, Fly.io, ECS...) is a separate decision.
+
 ## Design decisions worth knowing about — testing
 
 - **A dedicated `telemetry_test` database, created and torn down by the
@@ -606,5 +647,5 @@ docker compose exec api pytest tests/test_fusion.py -v
 5. ~~Sensor fusion logic (radar vs. ToF cross-validation)~~ ✅
 6. ~~Auth — per-device API keys (ingestion) + JWT (dashboard/REST)~~ ✅
 7. ~~Testing (pytest) — fusion, auth, devices, WebSocket ingestion~~ ✅
-8. CI/CD (GitHub Actions)
+8. ~~CI/CD (GitHub Actions) — tests, migration checks, Docker build + publish~~ ✅
 9. Full documentation + architecture diagram

@@ -1,0 +1,174 @@
+name: CI
+
+# Runs on every push to main and on every pull request targeting main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# If you push twice in quick succession to the same branch, cancel the older
+# run instead of burning CI minutes on a commit that's already out of date.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: jobs get read-only repo access unless they ask for more
+# (the docker job below asks for `packages: write`, only on main).
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11" # matches the Dockerfile's python:3.11-slim base
+
+jobs:
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    # Real Postgres + Redis, started as sidecar containers for this job.
+    # Credentials match the defaults in app/core/config.py, so no .env file
+    # is needed (and .env is gitignored, so it isn't in the checkout anyway).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: telemetry
+          POSTGRES_PASSWORD: telemetry_dev_password
+          POSTGRES_DB: telemetry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U telemetry"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # tests/conftest.py points the app at localhost + a throwaway
+      # `telemetry_test` database and Redis index, creating/dropping them itself.
+      - name: Run pytest
+        run: pytest -v
+
+  migrations:
+    name: Migrations (Alembic)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: telemetry
+          POSTGRES_PASSWORD: telemetry_dev_password
+          POSTGRES_DB: telemetry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U telemetry"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_HOST: localhost # settings default to the docker-compose hostname "db"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply all migrations to an empty database
+        run: alembic upgrade head
+
+      # Fails if the SQLAlchemy models and the migration history disagree,
+      # i.e. someone changed a model but forgot `alembic revision --autogenerate`.
+      - name: Check models and migrations are in sync
+        run: alembic check
+
+      # Catches the bug class we hit in step 2: a downgrade() that leaves
+      # Postgres ENUM types behind makes the next upgrade fail.
+      - name: Downgrade to base, then upgrade again
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    needs: [test, migrations] # don't build/publish an image from code that fails tests
+    permissions:
+      contents: read
+      packages: write # needed to push to GitHub Container Registry
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Computes the image name/tags. Needed because GHCR requires lowercase
+      # names and this repo's name has capitals.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: telemetry-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Cheap sanity check on the *built* image: imports the app inside the
+      # container, so a missing dependency or broken import fails CI instead
+      # of failing at deploy time. (No DB connection is made at import.)
+      - name: Smoke test image
+        run: docker run --rm telemetry-api:ci python -c "import app.main; print('import ok')"
+
+      # Publish only from main, never from pull requests.
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
